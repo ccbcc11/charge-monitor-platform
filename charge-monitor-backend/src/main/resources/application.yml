@@ -1,0 +1,164 @@
+# =========================================================
+# 新能源充电设施运行监测与智能告警平台
+# application.yml
+#
+# 当前阶段：MVP 第一版
+# 技术栈：
+# - Spring Boot 3.x
+# - MySQL 8
+# - Redis 6/7
+# - MyBatis-Plus
+# - Sa-Token
+# - Knife4j
+# =========================================================
+
+server:
+  port: 8080
+
+  # 不在这里配置 context-path。
+  # 原因：我们后续在 Controller 里统一写 /api，例如 /api/auth/login。
+  # 如果这里再配置 /api，容易出现 /api/api/auth/login。
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+spring:
+  application:
+    name: charge-monitor-backend
+
+  # 当前先使用本地开发环境
+  profiles:
+    active: dev
+
+  # ===================== MySQL 数据源配置 =====================
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/charge_monitor?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: '030215'
+
+  # ===================== Redis 配置 =====================
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+      timeout: 3000ms
+      password: '030215'
+
+  # ===================== JSON 时间格式配置 =====================
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+
+# ===================== MyBatis-Plus 配置 =====================
+mybatis-plus:
+  # 如果后续有复杂 SQL，可以放到 resources/mapper/**/*.xml
+  mapper-locations: classpath*:/mapper/**/*.xml
+
+  configuration:
+    # 数据库字段下划线自动映射为 Java 驼峰
+    # 例如：device_code -> deviceCode
+    map-underscore-to-camel-case: true
+
+    # 开发阶段打印 SQL，方便你看接口到底执行了什么 SQL
+    # 后期部署或压测时建议关闭
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+  global-config:
+    db-config:
+      # 主键策略：使用数据库自增 ID
+      id-type: auto
+
+      # 逻辑删除字段
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# ===================== Sa-Token 配置 =====================
+sa-token:
+  # Token 名称。
+  # 前端或 Apifox 请求时，在请求头里带：
+  # satoken: xxxxx
+  token-name: satoken
+
+  # Token 有效期，单位：秒。
+  # 86400 = 1 天
+  timeout: 86400
+
+  # 临时有效期。
+  # -1 表示不限制，即只要 token 没过期就有效。
+  active-timeout: -1
+
+  # 是否允许同一账号多地同时登录
+  is-concurrent: true
+
+  # 多人登录同一账号时，是否共用一个 token
+  is-share: true
+
+  # token 风格
+  token-style: uuid
+
+  # 是否从请求头读取 token
+  is-read-header: true
+
+  # 是否从 Cookie 读取 token。
+  # 前后端分离项目中，MVP 阶段建议先关闭。
+  is-read-cookie: false
+
+  # 是否从请求体读取 token
+  is-read-body: false
+
+  # 是否输出操作日志
+  is-log: true
+
+# ===================== Knife4j / OpenAPI 配置 =====================
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ===================== 项目自定义配置 =====================
+charge-monitor:
+  # 设备相关配置
+  device:
+    # 设备超过多少秒未上报，认为离线。
+    # MVP 阶段可以先不用定时任务，第二阶段做离线检测时会用到。
+    offline-seconds: 60
+
+  # Redis Key 前缀
+  redis:
+    key-prefix: charge-monitor
+
+  # MVP 阶段基础告警阈值
+  alarm:
+    temperature-threshold: 80.00
+    voltage-low-threshold: 180.00
+    network-delay-threshold: 200
+
+# ===================== 日志配置 =====================
+logging:
+  level:
+    root: info
+
+    # 你自己的项目包，开发阶段开 debug
+    com.liyancong.charge.monitor: debug
+
+    # MyBatis / MyBatis-Plus 日志
+    com.baomidou.mybatisplus: debug
+
+    # Spring Web 日志不用太细，否则控制台太乱
+    org.springframework.web: info
+
+  file:
+    name: logs/charge-monitor-backend.log
