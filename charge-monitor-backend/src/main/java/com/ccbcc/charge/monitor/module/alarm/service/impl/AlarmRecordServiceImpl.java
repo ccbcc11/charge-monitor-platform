@@ -8,6 +8,7 @@ import com.ccbcc.charge.monitor.common.result.ResultCode;
 import com.ccbcc.charge.monitor.module.alarm.dto.AlarmRecordPageQueryDTO;
 import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRecord;
 import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRecordMapper;
+import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmRecordService;
 import com.ccbcc.charge.monitor.module.alarm.vo.AlarmRecordDetailVO;
 import com.ccbcc.charge.monitor.module.alarm.vo.AlarmRecordPageVO;
@@ -35,6 +36,7 @@ public class AlarmRecordServiceImpl implements AlarmRecordService {
 
     private final AlarmRecordMapper alarmRecordMapper;
     private final DeviceInfoMapper deviceInfoMapper;
+    private final AlarmDetectService alarmDetectService;
     private final RedisTemplate<String, Object> redisTemplate;
 
     /**
@@ -184,6 +186,20 @@ public class AlarmRecordServiceImpl implements AlarmRecordService {
         update.setUpdateTime(now);
 
         alarmRecordMapper.updateById(update);
+
+        /*
+         * 如果是 CONTINUOUS 连续异常告警，清除 Redis 滑动窗口。
+         *
+         * 原因：
+         * 告警恢复后，如果不清除窗口，旧数据可能在下一次检测时立即再次触发告警，
+         * 导致"恢复→再次告警"的奇怪现象。
+         */
+        if ("CONTINUOUS".equals(alarmRecord.getAlarmType())) {
+            alarmDetectService.clearContinuousWindow(
+                    alarmRecord.getDeviceCode(),
+                    alarmRecord.getAlarmMetric()
+            );
+        }
 
         /*
          * 如果该设备已经没有其他未恢复告警，则从 Redis 当前告警设备集合中移除。

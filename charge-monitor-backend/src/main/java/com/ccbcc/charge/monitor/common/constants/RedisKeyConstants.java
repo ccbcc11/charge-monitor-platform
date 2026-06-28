@@ -8,6 +8,14 @@ public final class RedisKeyConstants {
     public static final String DEVICE_ALARM_SET = "device:alarm:set";
     public static final String ALARM_RULE_ENABLED = "alarm:rule:enabled";
 
+    /**
+     * 连续异常滑动窗口前缀
+     *
+     * 示例：
+     * alarm:continuous:window:CP-0001:RULE_TEMP_CONTINUE
+     */
+    public static final String CONTINUOUS_WINDOW_PREFIX = "alarm:continuous:window";
+
     private RedisKeyConstants() {
     }
 
@@ -28,5 +36,15 @@ public final class RedisKeyConstants {
      */
     public static String enabledAlarmRules(String alarmType) {
         return ALARM_RULE_ENABLED + ":" + alarmType;
+    }
+
+    /**
+     * 连续异常滑动窗口 key
+     *
+     * 示例：
+     * alarm:continuous:window:CP-0001:RULE_TEMP_CONTINUE
+     */
+    public static String continuousWindow(String deviceCode, String ruleCode) {
+        return CONTINUOUS_WINDOW_PREFIX + ":" + deviceCode + ":" + ruleCode;
     }
 }

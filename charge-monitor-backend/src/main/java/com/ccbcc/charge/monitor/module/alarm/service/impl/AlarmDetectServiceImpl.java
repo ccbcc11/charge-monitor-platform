@@ -1,10 +1,12 @@
 package com.ccbcc.charge.monitor.module.alarm.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ccbcc.charge.monitor.common.constants.RedisKeyConstants;
 import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRecord;
 import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRule;
 import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRecordMapper;
+import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRuleMapper;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmRuleCacheService;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
@@ -16,6 +18,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -25,15 +28,13 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * 告警检测服务实现类
  *
- * 当前阶段：
- * 1. 从 alarm_rule 表读取启用的 THRESHOLD 阈值规则
- * 2. 根据设备类型、指标名、运算符、阈值判断是否触发告警
- * 3. 触发后新增或更新 alarm_record
+ * 当前已实现：
+ * 1. THRESHOLD 阈值告警：单次数据判断，从 Redis 缓存读取规则
+ * 2. CONTINUOUS 连续异常告警：基于 Redis List 滑动窗口，统计窗口内命中次数
  *
  * 暂不处理：
  * 1. OFFLINE 离线告警：当前仍由 DeviceOfflineCheckTask 处理
- * 2. CONTINUOUS 连续异常：后续基于 Redis 窗口再实现
- * 3. FLUCTUATION 波动异常：后续再扩展
+ * 2. FLUCTUATION 波动异常：后续再扩展
  */
 @Slf4j
 @Service
@@ -41,6 +42,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public class AlarmDetectServiceImpl implements AlarmDetectService {
 
     private static final String ALARM_TYPE_THRESHOLD = "THRESHOLD";
+    private static final String ALARM_TYPE_CONTINUOUS = "CONTINUOUS";
 
     /**
      * 告警状态：0 未确认，1 已确认，2 已恢复
@@ -53,8 +55,17 @@ public class AlarmDetectServiceImpl implements AlarmDetectService {
      */
     private static final Integer RULE_ENABLED = 1;
 
+    /**
+     * 连续异常窗口 TTL
+     *
+     * 设备停止上报后，窗口 key 自动过期，避免 Redis 内存泄漏。
+     * 每次 LPUSH 时会通过 EXPIRE 续期。
+     */
+    private static final Duration WINDOW_TTL = Duration.ofMinutes(10);
+
     private final AlarmRuleCacheService alarmRuleCacheService;
     private final AlarmRecordMapper alarmRecordMapper;
+    private final AlarmRuleMapper alarmRuleMapper;
     private final StringRedisTemplate stringRedisTemplate;
 
     @Override
@@ -382,5 +393,258 @@ public class AlarmDetectServiceImpl implements AlarmDetectService {
         int randomPart = ThreadLocalRandom.current().nextInt(1000, 10000);
 
         return "AL" + timePart + randomPart;
+    }
+
+    // ==================== CONTINUOUS 连续异常告警 ====================
+
+    @Override
+    public List<Long> detectContinuousAlarms(DeviceInfo deviceInfo, DeviceData deviceData) {
+        List<Long> alarmIds = new ArrayList<>();
+
+        if (deviceInfo == null || deviceData == null) {
+            return alarmIds;
+        }
+
+        /*
+         * 第一步先直接从 MySQL 查 CONTINUOUS 规则。
+         *
+         * 原因：
+         * 目前 CONTINUOUS 规则数量很少（通常 1~2 条），
+         * 不需要像 THRESHOLD 那样引入缓存，避免增加复杂度。
+         * 等后续规则数量增多时再考虑缓存。
+         */
+        List<AlarmRule> rules = alarmRuleMapper.selectList(
+                new LambdaQueryWrapper<AlarmRule>()
+                        .eq(AlarmRule::getEnabled, RULE_ENABLED)
+                        .eq(AlarmRule::getAlarmType, ALARM_TYPE_CONTINUOUS)
+                        .orderByAsc(AlarmRule::getId)
+        );
+
+        if (rules == null || rules.isEmpty()) {
+            log.debug("当前没有启用的 CONTINUOUS 告警规则");
+            return alarmIds;
+        }
+
+        for (AlarmRule rule : rules) {
+            try {
+                Long alarmId = detectSingleContinuousRule(deviceInfo, deviceData, rule);
+                if (alarmId != null) {
+                    alarmIds.add(alarmId);
+                }
+            } catch (Exception e) {
+                log.warn(
+                        "执行连续异常告警规则失败，ruleCode={}，deviceCode={}",
+                        rule.getRuleCode(),
+                        deviceInfo.getDeviceCode(),
+                        e
+                );
+            }
+        }
+
+        return alarmIds;
+    }
+
+    @Override
+    public void clearContinuousWindow(String deviceCode, String alarmMetric) {
+        if (!StringUtils.hasText(deviceCode) || !StringUtils.hasText(alarmMetric)) {
+            return;
+        }
+
+        /*
+         * 连续异常告警的 ruleCode 无法仅凭 alarmMetric 确定。
+         * 因此这里遍历所有启用的 CONTINUOUS 规则，找到匹配指标的规则后删除对应窗口。
+         */
+        List<AlarmRule> rules = alarmRuleMapper.selectList(
+                new LambdaQueryWrapper<AlarmRule>()
+                        .eq(AlarmRule::getEnabled, RULE_ENABLED)
+                        .eq(AlarmRule::getAlarmType, ALARM_TYPE_CONTINUOUS)
+        );
+
+        if (rules == null || rules.isEmpty()) {
+            return;
+        }
+
+        for (AlarmRule rule : rules) {
+            if (!alarmMetric.equals(rule.getMetricName())) {
+                continue;
+            }
+
+            String windowKey = RedisKeyConstants.continuousWindow(deviceCode, rule.getRuleCode());
+
+            try {
+                Boolean deleted = stringRedisTemplate.delete(windowKey);
+                log.info(
+                        "清理连续异常滑动窗口，deviceCode={}，ruleCode={}，key={}，deleted={}",
+                        deviceCode,
+                        rule.getRuleCode(),
+                        windowKey,
+                        deleted
+                );
+            } catch (Exception e) {
+                log.warn("清理连续异常滑动窗口失败，key={}", windowKey, e);
+            }
+        }
+    }
+
+    /**
+     * 检测单条连续异常规则
+     */
+    private Long detectSingleContinuousRule(DeviceInfo deviceInfo,
+                                             DeviceData deviceData,
+                                             AlarmRule rule) {
+        if (!isRuleApplicableToDevice(deviceInfo, rule)) {
+            return null;
+        }
+
+        BigDecimal currentValue = getMetricValue(deviceData, rule.getMetricName());
+
+        /*
+         * 指标值为 null 表示本次未上报该指标。
+         *
+         * 注意：此时不向窗口 push 任何值。
+         * "没数据" ≠ "数据正常"，不能当成 0（未命中）处理。
+         */
+        if (currentValue == null) {
+            log.debug(
+                    "连续异常规则指标无当前值，跳过本次窗口更新，ruleCode={}，metricName={}，deviceCode={}",
+                    rule.getRuleCode(),
+                    rule.getMetricName(),
+                    deviceInfo.getDeviceCode()
+            );
+            return null;
+        }
+
+        if (rule.getThresholdValue() == null) {
+            log.warn(
+                    "连续异常规则阈值为空，跳过检测，ruleCode={}，metricName={}",
+                    rule.getRuleCode(),
+                    rule.getMetricName()
+            );
+            return null;
+        }
+
+        /*
+         * 判断本次是否命中规则（1=命中，0=未命中）
+         */
+        boolean hit = isTriggered(currentValue, rule.getOperator(), rule.getThresholdValue());
+        int hitValue = hit ? 1 : 0;
+
+        /*
+         * 更新 Redis 滑动窗口
+         */
+        int windowSize = rule.getWindowSize() != null ? rule.getWindowSize() : 5;
+        int triggerCount = rule.getTriggerCount() != null ? rule.getTriggerCount() : 3;
+
+        long hitCount = updateSlidingWindow(deviceInfo.getDeviceCode(), rule.getRuleCode(), hitValue, windowSize);
+
+        /*
+         * 窗口数据不足时，不触发告警。
+         *
+         * 例如 window_size=5，trigger_count=3：
+         * 设备刚上线窗口只有 2 条数据，此时 3 >= 2 永远为 false。
+         * 这是正确的行为——冷启动阶段数据不够，不能判定为连续异常。
+         */
+        if (hitCount < triggerCount) {
+            log.debug(
+                    "连续异常未达触发条件，ruleCode={}，deviceCode={}，hitCount={}，triggerCount={}",
+                    rule.getRuleCode(),
+                    deviceInfo.getDeviceCode(),
+                    hitCount,
+                    triggerCount
+            );
+            return null;
+        }
+
+        String alarmMessage = buildContinuousAlarmMessage(rule, currentValue, hitCount, windowSize);
+
+        return saveOrUpdateAlarmRecord(
+                deviceInfo,
+                rule,
+                currentValue,
+                rule.getThresholdValue(),
+                alarmMessage
+        );
+    }
+
+    /**
+     * 更新 Redis 滑动窗口
+     *
+     * 使用 LPUSH + LTRIM 实现固定大小窗口。
+     * 每次操作后重置 TTL，防止设备停报后 key 泄漏。
+     *
+     * @return 窗口中值为 1 的数量（即最近 window_size 次中命中的次数）
+     */
+    private long updateSlidingWindow(String deviceCode, String ruleCode, int hitValue, int windowSize) {
+        String windowKey = RedisKeyConstants.continuousWindow(deviceCode, ruleCode);
+
+        try {
+            String hitStr = String.valueOf(hitValue);
+
+            /*
+             * 使用管道减少网络往返，同时保证 TTL 重置。
+             */
+            stringRedisTemplate.opsForList().leftPush(windowKey, hitStr);
+            stringRedisTemplate.opsForList().trim(windowKey, 0, windowSize - 1);
+            stringRedisTemplate.expire(windowKey, WINDOW_TTL);
+
+            /*
+             * 统计窗口中值为 1 的数量
+             */
+            List<String> window = stringRedisTemplate.opsForList().range(windowKey, 0, -1);
+
+            if (window == null || window.isEmpty()) {
+                return 0;
+            }
+
+            return window.stream().filter("1"::equals).count();
+
+        } catch (Exception e) {
+            log.warn(
+                    "更新连续异常滑动窗口失败，deviceCode={}，ruleCode={}，hitValue={}",
+                    deviceCode,
+                    ruleCode,
+                    hitValue,
+                    e
+            );
+            return 0;
+        }
+    }
+
+    /**
+     * 构造连续异常告警文案
+     */
+    private String buildContinuousAlarmMessage(AlarmRule rule,
+                                                BigDecimal currentValue,
+                                                long hitCount,
+                                                int windowSize) {
+        String metricText = switch (rule.getMetricName()) {
+            case "temperature" -> "设备温度";
+            case "voltage" -> "设备电压";
+            case "current", "current_value" -> "设备电流";
+            case "power" -> "设备功率";
+            case "network_delay", "networkDelay" -> "网络延迟";
+            default -> rule.getMetricName();
+        };
+
+        String unit = switch (rule.getMetricName()) {
+            case "temperature" -> "℃";
+            case "voltage" -> "V";
+            case "current", "current_value" -> "A";
+            case "power" -> "kW";
+            case "network_delay", "networkDelay" -> "ms";
+            default -> "";
+        };
+
+        return String.format(
+                "%s连续异常触发%s，当前值%s%s，最近%d次中有%d次超过阈值%s%s",
+                metricText,
+                rule.getRuleName(),
+                currentValue,
+                unit,
+                windowSize,
+                hitCount,
+                rule.getThresholdValue(),
+                unit
+        );
     }
 }

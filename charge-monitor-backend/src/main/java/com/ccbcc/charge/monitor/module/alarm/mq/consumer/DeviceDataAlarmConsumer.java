@@ -30,9 +30,7 @@ import java.util.List;
  * 6. 更新 Redis device:alarm:set
  *
  * 注意：
- * 当前只处理 THRESHOLD 阈值告警。
  * OFFLINE 离线告警仍由 DeviceOfflineCheckTask 负责。
- * CONTINUOUS 连续异常后续单独扩展。
  */
 @Slf4j
 @Component
@@ -111,16 +109,16 @@ public class DeviceDataAlarmConsumer {
         /*
          * 3. 调用告警检测服务
          *
-         * 这里才是真正的异步告警判断。
-         * AlarmDetectServiceImpl 内部会：
-         * 1. 查询 alarm_rule 启用规则
-         * 2. 判断 temperature / voltage / network_delay 等指标
-         * 3. 新增或更新 alarm_record
-         * 4. 写入 Redis device:alarm:set
+         * 先执行 THRESHOLD 阈值告警，再执行 CONTINUOUS 连续异常告警。
+         * 两者独立检测，互不影响。
          */
-        List<Long> alarmIds = alarmDetectService.detectThresholdAlarms(deviceInfo, deviceData);
+        List<Long> thresholdAlarmIds = alarmDetectService.detectThresholdAlarms(deviceInfo, deviceData);
+        List<Long> continuousAlarmIds = alarmDetectService.detectContinuousAlarms(deviceInfo, deviceData);
 
-        if (alarmIds == null || alarmIds.isEmpty()) {
+        int totalAlarms = (thresholdAlarmIds == null ? 0 : thresholdAlarmIds.size())
+                + (continuousAlarmIds == null ? 0 : continuousAlarmIds.size());
+
+        if (totalAlarms == 0) {
             log.info(
                     "设备数据异步告警检测完成，未触发告警，deviceDataId={}，deviceCode={}",
                     deviceData.getId(),
@@ -130,10 +128,11 @@ public class DeviceDataAlarmConsumer {
         }
 
         log.info(
-                "设备数据异步告警检测完成，触发或更新告警，deviceDataId={}，deviceCode={}，alarmIds={}",
+                "设备数据异步告警检测完成，触发或更新告警，deviceDataId={}，deviceCode={}，thresholdAlarms={}，continuousAlarms={}",
                 deviceData.getId(),
                 deviceData.getDeviceCode(),
-                alarmIds
+                thresholdAlarmIds,
+                continuousAlarmIds
         );
     }
 
