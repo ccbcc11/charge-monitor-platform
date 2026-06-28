@@ -5,8 +5,8 @@ import com.ccbcc.charge.monitor.common.constants.RedisKeyConstants;
 import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRecord;
 import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRule;
 import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRecordMapper;
-import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRuleMapper;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
+import com.ccbcc.charge.monitor.module.alarm.service.AlarmRuleCacheService;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceInfo;
 import lombok.RequiredArgsConstructor;
@@ -53,7 +53,7 @@ public class AlarmDetectServiceImpl implements AlarmDetectService {
      */
     private static final Integer RULE_ENABLED = 1;
 
-    private final AlarmRuleMapper alarmRuleMapper;
+    private final AlarmRuleCacheService alarmRuleCacheService;
     private final AlarmRecordMapper alarmRecordMapper;
     private final StringRedisTemplate stringRedisTemplate;
 
@@ -66,17 +66,14 @@ public class AlarmDetectServiceImpl implements AlarmDetectService {
         }
 
         /*
-         * 只查询当前阶段支持的 THRESHOLD 阈值规则。
+         * 从 Redis 缓存获取启用的 THRESHOLD 规则。
+         *
+         * Redis 未命中时，会自动查询 MySQL 并回写 Redis。
          *
          * 表里可以保留 OFFLINE、CONTINUOUS 等规则，
          * 但这里暂时不处理，避免不同告警类型逻辑混在一起。
          */
-        List<AlarmRule> rules = alarmRuleMapper.selectList(
-                new LambdaQueryWrapper<AlarmRule>()
-                        .eq(AlarmRule::getEnabled, RULE_ENABLED)
-                        .eq(AlarmRule::getAlarmType, ALARM_TYPE_THRESHOLD)
-                        .orderByAsc(AlarmRule::getId)
-        );
+        List<AlarmRule> rules = alarmRuleCacheService.getEnabledThresholdRules();
 
         if (rules == null || rules.isEmpty()) {
             log.debug("当前没有启用的 THRESHOLD 告警规则");

@@ -28,6 +28,8 @@ public enum ResultCode {
 
     ALARM_ALREADY_EXISTS(52001, "告警已存在"),
     ALARM_NOT_FOUND(52002, "告警不存在"),
+    ALARM_RULE_NOT_FOUND(52003, "告警规则不存在"),
+    ALARM_RULE_CODE_EXISTS(52004, "告警规则编码已存在"),
 
     WORK_ORDER_NOT_FOUND(53001, "工单不存在"),
     WORK_ORDER_STATUS_ERROR(53002, "工单状态不正确"),

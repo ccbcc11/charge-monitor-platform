@@ -8,7 +8,6 @@ import com.ccbcc.charge.monitor.common.result.PageResult;
 import com.ccbcc.charge.monitor.common.result.ResultCode;
 import com.ccbcc.charge.monitor.module.alarm.mq.message.DeviceDataReportMessage;
 import com.ccbcc.charge.monitor.module.alarm.mq.producer.DeviceDataAlarmProducer;
-import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
 import com.ccbcc.charge.monitor.module.device.dto.DeviceDataHistoryQueryDTO;
 import com.ccbcc.charge.monitor.module.device.dto.DeviceDataReportDTO;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
@@ -43,14 +42,12 @@ import java.util.Objects;
  * 2. MySQL 历史数据入库
  * 3. 设备在线状态与最近心跳更新
  * 4. Redis 最新状态、心跳、在线集合维护
- * 5. 同步调用 AlarmDetectService 执行告警检测
- * 6. 事务提交成功后发送 RabbitMQ 消息，用于后续异步告警链路验证
- * 7. 查询最新状态与历史数据
+ * 5. 事务提交成功后发送 RabbitMQ 消息，由消费者异步执行告警检测
+ * 6. 查询最新状态与历史数据
  *
- * 当前阶段说明：
- * 这是 RabbitMQ 旁路验证版。
- * 即：同步告警逻辑暂时保留，同时额外发送 MQ 消息。
- * 等 MQ 消息收发验证完成后，再把同步告警正式迁移到消费者中。
+ * 说明：
+ * 告警检测已正式迁移到 DeviceDataAlarmConsumer 异步消费，
+ * 上报接口不再同步执行告警检测，避免阻塞 HTTP 响应。
  */
 @Slf4j
 @Service
@@ -157,8 +154,8 @@ public class DeviceDataServiceImpl implements DeviceDataService {
         /*
          * 8. 返回上报结果
          *
-         * 当前仍然返回同步告警结果。
-         * 等后面正式切换异步告警后，这里的 alarmTriggered 和 alarmIds 语义需要调整。
+         * 告警检测已异步化，此处不再同步返回告警结果。
+         * 告警结果以后以 alarm_record 查询为准。
          */
         return new DeviceDataReportVO()
                 .setDataId(deviceData.getId())

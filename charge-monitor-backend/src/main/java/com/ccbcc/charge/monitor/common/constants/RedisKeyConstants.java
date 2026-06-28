@@ -18,4 +18,15 @@ public final class RedisKeyConstants {
     public static String deviceHeartbeat(String deviceCode) {
         return DEVICE_HEARTBEAT_PREFIX + deviceCode;
     }
+
+    /**
+     * 启用告警规则缓存前缀
+     *
+     * 示例：
+     * alarm:rule:enabled:THRESHOLD
+     * alarm:rule:enabled:OFFLINE
+     */
+    public static String enabledAlarmRules(String alarmType) {
+        return ALARM_RULE_ENABLED + ":" + alarmType;
+    }
 }
