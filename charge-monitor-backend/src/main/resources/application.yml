@@ -54,6 +54,21 @@ spring:
     time-zone: Asia/Shanghai
     serialization:
       write-dates-as-timestamps: false
+  # ===================== rabbitMQ配置 =====================
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: auto
+        retry:
+          enabled: true
+          initial-interval: 1000
+          max-attempts: 3
+          multiplier: 2
 
 # ===================== MyBatis-Plus 配置 =====================
 mybatis-plus:
@@ -132,9 +147,12 @@ springdoc:
 charge-monitor:
   # 设备相关配置
   device:
-    # 设备超过多少秒未上报，认为离线。
-    # MVP 阶段可以先不用定时任务，第二阶段做离线检测时会用到。
-    offline-seconds: 60
+    offline:
+      # 设备超过多少秒未上报，认为离线。
+      # MVP 阶段可以先不用定时任务，第二阶段做离线检测时会用到。
+      enabled: true
+      fixed-delay: 3000000
+      offline-seconds: 60
 
   # Redis Key 前缀
   redis:
@@ -152,7 +170,7 @@ logging:
     root: info
 
     # 你自己的项目包，开发阶段开 debug
-    com.liyancong.charge.monitor: debug
+    com.ccbcc.charge.monitor: debug
 
     # MyBatis / MyBatis-Plus 日志
     com.baomidou.mybatisplus: debug

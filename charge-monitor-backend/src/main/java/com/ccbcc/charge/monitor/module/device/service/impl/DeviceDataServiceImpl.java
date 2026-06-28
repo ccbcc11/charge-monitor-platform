@@ -2,11 +2,13 @@ package com.ccbcc.charge.monitor.module.device.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.ccbcc.charge.monitor.common.constants.RedisKeyConstants;
 import com.ccbcc.charge.monitor.common.exception.BusinessException;
 import com.ccbcc.charge.monitor.common.result.PageResult;
 import com.ccbcc.charge.monitor.common.result.ResultCode;
-import com.ccbcc.charge.monitor.module.alarm.entity.AlarmRecord;
-import com.ccbcc.charge.monitor.module.alarm.mapper.AlarmRecordMapper;
+import com.ccbcc.charge.monitor.module.alarm.mq.message.DeviceDataReportMessage;
+import com.ccbcc.charge.monitor.module.alarm.mq.producer.DeviceDataAlarmProducer;
+import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
 import com.ccbcc.charge.monitor.module.device.dto.DeviceDataHistoryQueryDTO;
 import com.ccbcc.charge.monitor.module.device.dto.DeviceDataReportDTO;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
@@ -24,47 +26,55 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
-import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 设备运行数据服务实现类
+ *
+ * 当前职责：
+ * 1. 设备运行数据上报
+ * 2. MySQL 历史数据入库
+ * 3. 设备在线状态与最近心跳更新
+ * 4. Redis 最新状态、心跳、在线集合维护
+ * 5. 同步调用 AlarmDetectService 执行告警检测
+ * 6. 事务提交成功后发送 RabbitMQ 消息，用于后续异步告警链路验证
+ * 7. 查询最新状态与历史数据
+ *
+ * 当前阶段说明：
+ * 这是 RabbitMQ 旁路验证版。
+ * 即：同步告警逻辑暂时保留，同时额外发送 MQ 消息。
+ * 等 MQ 消息收发验证完成后，再把同步告警正式迁移到消费者中。
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class DeviceDataServiceImpl implements DeviceDataService {
 
-    private final DeviceInfoMapper deviceInfoMapper;
-    private final DeviceDataMapper deviceDataMapper;
-    private final AlarmRecordMapper alarmRecordMapper;
-    private final RedisTemplate<String, Object> redisTemplate;
-    private final ObjectMapper objectMapper;
-
-    private static final String DEVICE_STATUS_KEY_PREFIX = "device:status:";
-    private static final String DEVICE_HEARTBEAT_KEY_PREFIX = "device:heartbeat:";
-    private static final String DEVICE_ONLINE_SET_KEY = "device:online:set";
-    private static final String DEVICE_ALARM_SET_KEY = "device:alarm:set";
-
     private static final Integer ONLINE_STATUS_ONLINE = 1;
+
+    /**
+     * 运行状态：0 停用
+     */
     private static final Integer RUNNING_STATUS_DISABLED = 0;
 
-    private static final String ALARM_TYPE_THRESHOLD = "THRESHOLD";
+    /**
+     * Redis 心跳时间格式
+     */
+    private static final DateTimeFormatter HEARTBEAT_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    private static final String METRIC_TEMPERATURE = "temperature";
-    private static final String METRIC_VOLTAGE = "voltage";
-    private static final String METRIC_NETWORK_DELAY = "network_delay";
-
-    private static final BigDecimal TEMPERATURE_THRESHOLD = BigDecimal.valueOf(80.00);
-    private static final BigDecimal VOLTAGE_LOW_THRESHOLD = BigDecimal.valueOf(180.00);
-    private static final BigDecimal NETWORK_DELAY_THRESHOLD = BigDecimal.valueOf(200.00);
+    private final DeviceInfoMapper deviceInfoMapper;
+    private final DeviceDataMapper deviceDataMapper;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final ObjectMapper objectMapper;
+    private final DeviceDataAlarmProducer deviceDataAlarmProducer;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -83,50 +93,78 @@ public class DeviceDataServiceImpl implements DeviceDataService {
         }
 
         /*
-         * 3. 保存设备运行数据到 MySQL
+         * 3. 确定本次心跳时间
+         *
+         * reportTime 是设备上报时间。
+         * 如果设备端没有传，则使用服务端当前时间兜底。
+         */
+        LocalDateTime heartbeatTime = reportDTO.getReportTime() == null
+                ? LocalDateTime.now()
+                : reportDTO.getReportTime();
+
+        /*
+         * 4. 保存设备运行数据到 MySQL
          */
         DeviceData deviceData = new DeviceData();
         BeanUtils.copyProperties(reportDTO, deviceData);
 
         deviceData.setDeviceId(deviceInfo.getId());
         deviceData.setDeviceCode(deviceInfo.getDeviceCode());
+        deviceData.setReportTime(heartbeatTime);
         deviceData.setCreateTime(LocalDateTime.now());
 
         deviceDataMapper.insert(deviceData);
 
         /*
-         * 4. 更新设备在线状态和最近心跳
+         * 5. 更新设备在线状态和最近心跳
          */
         DeviceInfo updateDevice = new DeviceInfo();
         updateDevice.setId(deviceInfo.getId());
         updateDevice.setOnlineStatus(ONLINE_STATUS_ONLINE);
-        updateDevice.setLastHeartbeat(reportDTO.getReportTime());
+        updateDevice.setLastHeartbeat(heartbeatTime);
         updateDevice.setUpdateTime(LocalDateTime.now());
 
         deviceInfoMapper.updateById(updateDevice);
 
+        /*
+         * 同步更新当前内存中的 deviceInfo，便于后续构造 VO 和告警检测。
+         */
         deviceInfo.setOnlineStatus(ONLINE_STATUS_ONLINE);
-        deviceInfo.setLastHeartbeat(reportDTO.getReportTime());
+        deviceInfo.setLastHeartbeat(heartbeatTime);
 
         /*
-         * 5. 写入 Redis 最新状态、心跳、在线集合
+         * 6. 写入 Redis 最新状态、心跳、在线集合
          */
         DeviceLatestStatusVO latestStatusVO = buildLatestStatusVO(deviceInfo, deviceData, true);
-        writeLatestStatusToRedis(deviceInfo.getDeviceCode(), latestStatusVO, reportDTO.getReportTime());
+        writeLatestStatusToRedis(deviceInfo.getDeviceCode(), latestStatusVO, heartbeatTime);
 
         /*
-         * 6. 执行 MVP 基础阈值告警
+         * 7. 事务提交成功后发送 MQ 消息
+         *
+         * 注意：
+         * 这里不要在事务提交前直接发送。
+         * 否则消费者可能先收到消息，但 device_data 事务还没提交，
+         * 消费者根据 deviceDataId 查询时可能查不到数据。
          */
-        List<Long> alarmIds = detectThresholdAlarms(deviceInfo, deviceData);
+        DeviceDataReportMessage message = new DeviceDataReportMessage()
+                .setDeviceDataId(deviceData.getId())
+                .setDeviceId(deviceInfo.getId())
+                .setDeviceCode(deviceInfo.getDeviceCode())
+                .setReportTime(heartbeatTime);
+
+        sendMqAfterTransactionCommit(message);
 
         /*
-         * 7. 返回上报结果
+         * 8. 返回上报结果
+         *
+         * 当前仍然返回同步告警结果。
+         * 等后面正式切换异步告警后，这里的 alarmTriggered 和 alarmIds 语义需要调整。
          */
         return new DeviceDataReportVO()
                 .setDataId(deviceData.getId())
                 .setDeviceCode(deviceInfo.getDeviceCode())
-                .setAlarmTriggered(!alarmIds.isEmpty())
-                .setAlarmIds(alarmIds);
+                .setAlarmTriggered(false)
+                .setAlarmIds(List.of());
     }
 
     @Override
@@ -141,7 +179,7 @@ public class DeviceDataServiceImpl implements DeviceDataService {
         /*
          * 1. 优先查询 Redis
          */
-        String redisKey = DEVICE_STATUS_KEY_PREFIX + deviceCode;
+        String redisKey = RedisKeyConstants.deviceStatus(deviceCode);
 
         try {
             Object cached = redisTemplate.opsForValue().get(redisKey);
@@ -152,7 +190,7 @@ public class DeviceDataServiceImpl implements DeviceDataService {
                 return vo;
             }
         } catch (Exception e) {
-            log.warn("查询设备最新状态Redis缓存失败，deviceCode={}", deviceCode, e);
+            log.warn("查询设备最新状态 Redis 缓存失败，deviceCode={}", deviceCode, e);
         }
 
         /*
@@ -166,7 +204,11 @@ public class DeviceDataServiceImpl implements DeviceDataService {
          * 3. 如果 MySQL 有历史数据，则回写 Redis
          */
         if (latestData != null) {
-            writeLatestStatusToRedis(deviceCode, vo, latestData.getReportTime());
+            LocalDateTime heartbeatTime = latestData.getReportTime() == null
+                    ? LocalDateTime.now()
+                    : latestData.getReportTime();
+
+            writeLatestStatusToRedis(deviceCode, vo, heartbeatTime);
         }
 
         return vo;
@@ -215,6 +257,10 @@ public class DeviceDataServiceImpl implements DeviceDataService {
      * 根据设备编号查询设备
      */
     private DeviceInfo getDeviceByCode(String deviceCode) {
+        if (!StringUtils.hasText(deviceCode)) {
+            throw new BusinessException(ResultCode.PARAM_ERROR, "设备编号不能为空");
+        }
+
         DeviceInfo deviceInfo = deviceInfoMapper.selectOne(
                 new LambdaQueryWrapper<DeviceInfo>()
                         .eq(DeviceInfo::getDeviceCode, deviceCode)
@@ -229,208 +275,82 @@ public class DeviceDataServiceImpl implements DeviceDataService {
     }
 
     /**
-     * 写入 Redis 最新状态
+     * 写入 Redis 最新状态、心跳、在线集合
      */
     private void writeLatestStatusToRedis(String deviceCode,
                                           DeviceLatestStatusVO latestStatusVO,
                                           LocalDateTime heartbeatTime) {
         try {
-            redisTemplate.opsForValue().set(DEVICE_STATUS_KEY_PREFIX + deviceCode, latestStatusVO);
-            redisTemplate.opsForValue().set(DEVICE_HEARTBEAT_KEY_PREFIX + deviceCode, heartbeatTime);
-            redisTemplate.opsForSet().add(DEVICE_ONLINE_SET_KEY, deviceCode);
+            /*
+             * 1. 设备最新状态
+             */
+            redisTemplate.opsForValue()
+                    .set(RedisKeyConstants.deviceStatus(deviceCode), latestStatusVO);
+
+            /*
+             * 2. 设备心跳
+             *
+             * 这里存 yyyy-MM-dd HH:mm:ss 字符串，
+             * 方便离线检测任务用 StringRedisTemplate 读取。
+             */
+            String heartbeatText = heartbeatTime == null
+                    ? LocalDateTime.now().format(HEARTBEAT_FORMATTER)
+                    : heartbeatTime.format(HEARTBEAT_FORMATTER);
+
+            redisTemplate.opsForValue()
+                    .set(RedisKeyConstants.deviceHeartbeat(deviceCode), heartbeatText);
+
+            /*
+             * 3. 在线设备集合
+             */
+            redisTemplate.opsForSet()
+                    .add(RedisKeyConstants.DEVICE_ONLINE_SET, deviceCode);
+
         } catch (Exception e) {
-            log.warn("写入设备最新状态Redis缓存失败，deviceCode={}", deviceCode, e);
+            log.warn("写入设备最新状态 Redis 缓存失败，deviceCode={}", deviceCode, e);
         }
     }
 
     /**
-     * 执行 MVP 阈值告警检测
+     * 事务提交成功后发送 MQ 消息
+     *
+     * 目的：
+     * 保证 device_data、device_info 等数据库操作真正提交成功后，
+     * 再通知消费者处理告警逻辑。
      */
-    private List<Long> detectThresholdAlarms(DeviceInfo deviceInfo, DeviceData deviceData) {
-        List<Long> alarmIds = new ArrayList<>();
-
-        Long temperatureAlarmId = handleTemperatureAlarm(deviceInfo, deviceData);
-        if (temperatureAlarmId != null) {
-            alarmIds.add(temperatureAlarmId);
+    private void sendMqAfterTransactionCommit(DeviceDataReportMessage message) {
+        if (message == null) {
+            return;
         }
 
-        Long voltageAlarmId = handleVoltageAlarm(deviceInfo, deviceData);
-        if (voltageAlarmId != null) {
-            alarmIds.add(voltageAlarmId);
-        }
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
 
-        Long networkDelayAlarmId = handleNetworkDelayAlarm(deviceInfo, deviceData);
-        if (networkDelayAlarmId != null) {
-            alarmIds.add(networkDelayAlarmId);
-        }
+                @Override
+                public void afterCommit() {
+                    deviceDataAlarmProducer.sendDeviceDataReportMessage(message);
+                }
 
-        return alarmIds;
-    }
-
-    /**
-     * 温度过高告警：temperature > 80
-     */
-    private Long handleTemperatureAlarm(DeviceInfo deviceInfo, DeviceData deviceData) {
-        BigDecimal value = deviceData.getTemperature();
-
-        if (value == null || value.compareTo(TEMPERATURE_THRESHOLD) <= 0) {
-            return null;
-        }
-
-        return createOrUpdateThresholdAlarm(
-                deviceInfo,
-                METRIC_TEMPERATURE,
-                3,
-                value,
-                TEMPERATURE_THRESHOLD,
-                "设备温度超过阈值，当前温度" + value + "℃，阈值" + TEMPERATURE_THRESHOLD + "℃"
-        );
-    }
-
-    /**
-     * 电压过低告警：voltage < 180
-     */
-    private Long handleVoltageAlarm(DeviceInfo deviceInfo, DeviceData deviceData) {
-        BigDecimal value = deviceData.getVoltage();
-
-        if (value == null || value.compareTo(VOLTAGE_LOW_THRESHOLD) >= 0) {
-            return null;
-        }
-
-        return createOrUpdateThresholdAlarm(
-                deviceInfo,
-                METRIC_VOLTAGE,
-                2,
-                value,
-                VOLTAGE_LOW_THRESHOLD,
-                "设备电压低于阈值，当前电压" + value + "V，阈值" + VOLTAGE_LOW_THRESHOLD + "V"
-        );
-    }
-
-    /**
-     * 网络延迟过高告警：networkDelay > 200
-     */
-    private Long handleNetworkDelayAlarm(DeviceInfo deviceInfo, DeviceData deviceData) {
-        Integer value = deviceData.getNetworkDelay();
-
-        if (value == null || BigDecimal.valueOf(value).compareTo(NETWORK_DELAY_THRESHOLD) <= 0) {
-            return null;
-        }
-
-        return createOrUpdateThresholdAlarm(
-                deviceInfo,
-                METRIC_NETWORK_DELAY,
-                1,
-                BigDecimal.valueOf(value),
-                NETWORK_DELAY_THRESHOLD,
-                "设备网络延迟超过阈值，当前延迟" + value + "ms，阈值" + NETWORK_DELAY_THRESHOLD + "ms"
-        );
-    }
-
-    /**
-     * 新增或更新阈值告警
-     */
-    private Long createOrUpdateThresholdAlarm(DeviceInfo deviceInfo,
-                                              String alarmMetric,
-                                              Integer alarmLevel,
-                                              BigDecimal currentValue,
-                                              BigDecimal thresholdValue,
-                                              String alarmMessage) {
-
-        AlarmRecord existing = alarmRecordMapper.selectUnrecoveredAlarm(
-                deviceInfo.getId(),
-                ALARM_TYPE_THRESHOLD,
-                alarmMetric
-        );
-
-        LocalDateTime now = LocalDateTime.now();
-
-        /*
-         * 1. 不存在未恢复告警：新增告警
-         */
-        if (existing == null) {
-            AlarmRecord record = new AlarmRecord();
-
-            record.setAlarmNo(generateAlarmNo());
-            record.setDeviceId(deviceInfo.getId());
-            record.setDeviceCode(deviceInfo.getDeviceCode());
-            record.setAlarmType(ALARM_TYPE_THRESHOLD);
-            record.setAlarmMetric(alarmMetric);
-            record.setAlarmLevel(alarmLevel);
-            record.setCurrentValue(currentValue);
-            record.setThresholdValue(thresholdValue);
-            record.setAlarmMessage(alarmMessage);
-            record.setAlarmStatus(0);
-            record.setFirstTime(now);
-            record.setLastTime(now);
-            record.setRecoverTime(null);
-            record.setAlarmCount(1);
-            record.setWorkOrderGenerated(0);
-            record.setDedupKey(buildDedupKey(deviceInfo.getDeviceCode(), ALARM_TYPE_THRESHOLD, alarmMetric));
-            record.setCreateTime(now);
-            record.setUpdateTime(now);
-            record.setDeleted(0);
-
-            alarmRecordMapper.insert(record);
-
-            addDeviceToAlarmSet(deviceInfo.getDeviceCode());
-
-            return record.getId();
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != STATUS_COMMITTED) {
+                        log.warn(
+                                "设备数据上报事务未提交成功，取消发送 MQ 消息，deviceDataId={}，deviceCode={}，status={}",
+                                message.getDeviceDataId(),
+                                message.getDeviceCode(),
+                                status
+                        );
+                    }
+                }
+            });
+            return;
         }
 
         /*
-         * 2. 已存在未恢复告警：只更新告警次数和最近发生时间
+         * 理论上 report() 方法有 @Transactional，正常不会走到这里。
+         * 这里作为兜底，防止未来复用该方法时没有事务上下文。
          */
-        Integer oldCount = existing.getAlarmCount() == null ? 0 : existing.getAlarmCount();
-
-        existing.setCurrentValue(currentValue);
-        existing.setThresholdValue(thresholdValue);
-        existing.setAlarmMessage(alarmMessage);
-        existing.setLastTime(now);
-        existing.setAlarmCount(oldCount + 1);
-        existing.setUpdateTime(now);
-
-        alarmRecordMapper.updateById(existing);
-
-        addDeviceToAlarmSet(deviceInfo.getDeviceCode());
-
-        return existing.getId();
-    }
-
-    /**
-     * 生成告警编号
-     *
-     * 格式示例：
-     * AL202606261955301230456
-     */
-    private String generateAlarmNo() {
-        String timePart = LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS"));
-
-        int randomPart = ThreadLocalRandom.current().nextInt(1000, 10000);
-
-        return "AL" + timePart + randomPart;
-    }
-
-    /**
-     * 构建告警去重键
-     *
-     * 格式：
-     * CP-0001:THRESHOLD:temperature
-     */
-    private String buildDedupKey(String deviceCode, String alarmType, String alarmMetric) {
-        return deviceCode + ":" + alarmType + ":" + alarmMetric;
-    }
-
-    /**
-     * 将设备加入 Redis 告警设备集合
-     */
-    private void addDeviceToAlarmSet(String deviceCode) {
-        try {
-            redisTemplate.opsForSet().add(DEVICE_ALARM_SET_KEY, deviceCode);
-        } catch (Exception e) {
-            log.warn("写入Redis告警设备集合失败，deviceCode={}", deviceCode, e);
-        }
+        deviceDataAlarmProducer.sendDeviceDataReportMessage(message);
     }
 
     /**

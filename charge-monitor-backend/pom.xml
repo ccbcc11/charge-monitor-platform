@@ -117,6 +117,13 @@
             <scope>provided</scope>
         </dependency>
 
+        <!-- ===================== 消息队列 ===================== -->
+        <!-- RabbitMQ / Spring AMQP -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
 
         <!-- ===================== 测试依赖 ===================== -->
 
