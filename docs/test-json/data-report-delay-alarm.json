@@ -1,0 +1,11 @@
+{
+  "deviceCode": "CP-0001",
+  "voltage": 220.00,
+  "currentValue": 31.50,
+  "power": 6.90,
+  "temperature": 44.00,
+  "soc": 65.00,
+  "networkDelay": 350,
+  "faultCode": "NORMAL",
+  "reportTime": "2026-06-26 14:30:00"
+}

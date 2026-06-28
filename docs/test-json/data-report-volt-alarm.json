@@ -1,0 +1,11 @@
+{
+  "deviceCode": "CP-0001",
+  "voltage": 165.30,
+  "currentValue": 30.10,
+  "power": 5.00,
+  "temperature": 42.00,
+  "soc": 60.00,
+  "networkDelay": 85,
+  "faultCode": "VOLT_LOW",
+  "reportTime": "2026-06-26 14:30:00"
+}

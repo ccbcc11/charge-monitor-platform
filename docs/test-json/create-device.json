@@ -1,0 +1,14 @@
+{
+  "deviceCode": "CP-0006",
+  "deviceName": "六号直流快充桩",
+  "stationName": "城东充电站",
+  "region": "城东区",
+  "deviceType": "DC",
+  "ratedPower": 120.00,
+  "longitude": 118.796900,
+  "latitude": 32.060300,
+  "runningStatus": 1,
+  "managerId": 2,
+  "installTime": "2026-06-26 09:00:00",
+  "remark": "新增测试设备"
+}
