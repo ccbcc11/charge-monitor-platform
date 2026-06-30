@@ -1,110 +1,79 @@
 # 新能源充电设施运行监测与智能告警平台
 
-面向新能源充电设施运维场景的后端管理平台，实现设备台账管理、运行数据上报、实时状态监测、异常告警和统计分析。
+面向新能源充电设施运维场景的后端管理平台，实现设备台账管理、运行数据上报、实时状态监测、动态规则告警、实时推送和工单流转闭环。
 
-## MVP 核心闭环
+## 核心业务流程
 
 ```text
-登录认证 → 设备管理 → 数据上报 → Redis 实时状态 → 基础阈值告警 → 告警查询/确认/恢复 → 运行概览
+设备运行数据上报
+→ MySQL 历史数据保存 + Redis 实时状态更新
+→ RabbitMQ 异步投递
+→ 消费者从 Redis 缓存读取启用规则
+→ THRESHOLD 阈值告警检测
+→ CONTINUOUS 连续异常检测（Redis 滑动窗口）
+→ alarm_record 告警记录生成
+→ 事务提交后 WebSocket 实时推送
+→ alarm_level=3 严重告警自动生成 work_order
+→ 运维人员接单 → 处理 → 完成
 ```
-
-**当前版本：MVP v1（第一阶段完成）**
-
----
 
 ## 技术栈
 
 | 技术 | 版本 | 用途 |
 |---|---|---|
-| Spring Boot | 3.x | 后端框架 |
+| Spring Boot | 3.3.13 | 后端框架 |
 | JDK | 17 | 运行环境 |
-| MyBatis-Plus | 3.x | ORM / 分页 / 逻辑删除 |
+| MyBatis-Plus | 3.5.16 | ORM / 分页 / 逻辑删除 |
 | MySQL | 8.0+ | 关系数据库 |
-| Redis | 6/7 | 实时状态缓存 / 在线集合 |
-| Sa-Token | 1.x | 登录认证 / 权限控制 |
-| Knife4j | 4.x | 接口文档 |
-| Hutool | 5.x | 工具类（SHA-256 等） |
-| Lombok | — | 简化代码 |
-
----
+| Redis | 6/7 | 规则缓存 / 滑动窗口 / 实时状态 / 心跳 |
+| RabbitMQ | 3.x | 异步告警消息队列 |
+| WebSocket | Spring 原生 | 告警实时推送 |
+| Sa-Token | 1.45.0 | 登录认证 |
+| Knife4j | 4.5.0 | 接口文档 |
+| Hutool | 5.8.36 | 工具类 |
 
 ## 项目结构
 
-```text
+```
 charge-monitor-platform/
-├── README.md                           # 项目总说明
-├── docs/                               # 项目文档
-│   ├── 01-需求说明.md                   # 项目背景、目标、功能范围
-│   ├── 02-系统架构设计.md               # 架构设计、分层说明
-│   ├── 03-数据库设计.md                 # 表结构、字段、索引、枚举
-│   ├── 04-接口文档说明.md               # 接口路径、参数、响应、状态码
-│   ├── 05-告警规则设计.md               # 告警规则体系设计
-│   └── 06-部署运行文档.md               # 部署运行说明
-├── sql/                                # 数据库脚本
-│   ├── init.sql                        # 建库 + 建表 + 初始化数据（一步到位）
-│   └── demo_data.sql                   # 额外演示数据（可选）
-└── charge-monitor-backend/             # 后端模块
-    ├── pom.xml                         # Maven 依赖
+├── README.md
+├── docs/
+│   ├── 01-需求说明.md
+│   ├── 02-系统架构设计.md
+│   ├── 03-数据库设计.md
+│   ├── 04-接口文档说明.md
+│   ├── 05-告警规则设计.md
+│   ├── 06-部署运行文档.md
+│   ├── 07-接口测试指南.md
+│   └── 08-项目亮点总结.md
+├── sql/
+│   ├── init.sql
+│   └── work_order.sql
+└── charge-monitor-backend/
     └── src/main/java/com/ccbcc/charge/monitor/
-        ├── ChargeMonitorApplication.java   # 启动类
-        ├── common/                         # 公共模块
-        │   ├── constants/                  # 常量（RedisKeyConstants 等）
-        │   ├── exception/                  # 全局异常处理
-        │   └── result/                     # 统一返回结构
-        ├── config/                         # 配置类（Sa-Token / Redis / MyBatis-Plus / Knife4j）
-        ├── module/                         # 业务模块
-        │   ├── auth/                       # 认证模块（登录 / 退出 / 用户信息）
-        │   ├── user/                       # 用户模块（Entity / Mapper）
-        │   ├── device/                     # 设备模块（设备管理 / 数据上报 / 状态查询）
-        │   ├── alarm/                      # 告警模块（告警查询 / 确认 / 恢复）
-        │   └── report/                     # 报表模块（今日运行概览）
-        ├── task/                           # 定时任务
-        │   ├── DeviceOfflineCheckTask.java # 设备离线检测（第二阶段完善）
-        │   └── DailyReportTask.java        # 运行日报（第二阶段完善）
-        └── simulator/                      # 模拟器
-            └── DeviceDataSimulator.java    # 设备数据模拟器（第二阶段完善）
+        ├── config/          # MyBatis-Plus / Redis / Sa-Token / RabbitMQ / WebSocket / Knife4j
+        ├── common/          # 统一返回、异常处理、常量
+        ├── module/
+        │   ├── auth/        # 登录认证
+        │   ├── device/      # 设备管理 + 数据上报
+        │   ├── alarm/       # 告警检测 + 告警记录 + 规则管理 + MQ 消费 + WebSocket
+        │   ├── report/      # 运行概览报表
+        │   └── workorder/   # 工单管理 + 自动生成
+        └── task/            # 设备离线检测定时任务
 ```
-
-### 分层说明
-
-每个业务模块统一采用以下分层：
-
-```text
-controller/   → 接收请求、参数校验、调用 Service
-dto/          → 接收前端请求参数
-vo/           → 返回给前端的视图对象
-entity/       → 数据库实体（与表结构一一对应）
-mapper/       → MyBatis-Plus Mapper 接口
-service/      → 业务逻辑接口
-service/impl/ → 业务逻辑实现
-```
-
----
 
 ## 数据库表
-
-### MVP 核心表（6 张）
 
 | 表名 | 说明 |
 |---|---|
 | `sys_user` | 用户表 |
-| `sys_role` | 角色表（admin / operator / viewer） |
+| `sys_role` | 角色表 |
 | `sys_user_role` | 用户角色关联表 |
-| `device_info` | 设备信息表（台账） |
-| `device_data` | 设备运行数据表（历史遥测） |
+| `device_info` | 设备信息表 |
+| `device_data` | 设备运行数据表 |
+| `alarm_rule` | 告警规则表（动态配置） |
 | `alarm_record` | 告警记录表 |
-
-### 第二阶段预留表（5 张）
-
-| 表名 | 说明 |
-|---|---|
-| `alarm_rule` | 告警规则表（表结构已完成，数据已预置） |
-| `work_order` | 工单表（表结构已完成） |
-| `work_order_log` | 工单流转日志表（表结构已完成） |
-| `operation_log` | 操作日志表（表结构已完成） |
-| `daily_report` | 运行日报表（表结构已完成） |
-
----
+| `work_order` | 运维工单表 |
 
 ## 快速开始
 
@@ -114,160 +83,120 @@ service/impl/ → 业务逻辑实现
 - Maven 3.6+
 - MySQL 8.0+
 - Redis 6/7
+- RabbitMQ 3.x
 
-### 2. 初始化数据库
+### 2. 基础服务启动
 
 ```bash
-# 连接 MySQL 执行 init.sql
-mysql -u root -p < sql/init.sql
+# MySQL（确保已启动）
+# Redis
+redis-server
+
+# RabbitMQ（Docker 方式）
+docker run -d --name rabbitmq \
+  -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=guest \
+  -e RABBITMQ_DEFAULT_PASS=guest \
+  rabbitmq:3.13-management
 ```
 
-该脚本会：
-- 创建 `charge_monitor` 数据库
-- 创建 11 张表（6 张 MVP + 5 张第二阶段预留）
-- 初始化 3 个角色、3 个用户、5 台设备、4 条告警规则、4 条运行数据、1 条示例告警
+### 3. 初始化数据库
 
-### 3. 配置环境变量
+在 IDEA 数据库工具或 Navicat 中执行 `sql/init.sql`，再执行 `sql/work_order.sql`。
+
+### 4. 配置环境变量
 
 ```bash
-# MySQL 用户名（必填）
 export MYSQL_USERNAME=root
-
-# MySQL 密码（必填）
 export MYSQL_PASSWORD=your_password
-
-# Redis 密码（如果 Redis 有密码则必填，无密码可留空）
-export REDIS_PASSWORD=
+export REDIS_PASSWORD=           # Redis 无密码可留空
 ```
 
-### 4. 启动项目
+### 5. 启动项目
 
 ```bash
 cd charge-monitor-backend
-
-# 编译
-mvn clean package -DskipTests
-
-# 启动
 mvn spring-boot:run
 ```
 
-或者直接在 IDE（IntelliJ IDEA）中运行 `ChargeMonitorApplication.java`。
+或在 IDEA 中运行 `ChargeMonitorApplication.java`。
 
-### 5. 验证启动
+### 6. 验证
 
-启动成功后访问：
-
-- 接口文档（Knife4j）：http://localhost:8080/doc.html
-- Swagger UI：http://localhost:8080/swagger-ui.html
-- API 基础路径：http://localhost:8080/api
-
----
+- Knife4j 接口文档：http://localhost:8080/doc.html
+- 测试账号：`admin` / `123456`
 
 ## 接口概览
 
-| 模块 | 方法 | 路径 | 说明 |
-|---|---|---|---|
-| 认证 | POST | `/api/auth/login` | 用户登录 |
-| 认证 | GET | `/api/auth/userInfo` | 获取当前用户信息 |
-| 认证 | POST | `/api/auth/logout` | 用户退出 |
-| 设备 | POST | `/api/device` | 新增设备 |
-| 设备 | PUT | `/api/device/{id}` | 修改设备 |
-| 设备 | DELETE | `/api/device/{id}` | 删除设备（逻辑删除） |
-| 设备 | GET | `/api/device/page` | 分页查询设备 |
-| 设备 | GET | `/api/device/{id}` | 查询设备详情 |
-| 数据 | POST | `/api/device/data/report` | 上报设备运行数据 |
-| 数据 | GET | `/api/device/data/latest/{deviceCode}` | 查询设备最新状态 |
-| 数据 | GET | `/api/device/data/history` | 查询设备历史数据 |
-| 告警 | GET | `/api/alarm/record/page` | 分页查询告警 |
-| 告警 | GET | `/api/alarm/record/{id}` | 查询告警详情 |
-| 告警 | PUT | `/api/alarm/record/{id}/ack` | 确认告警 |
-| 告警 | PUT | `/api/alarm/record/{id}/recover` | 恢复告警 |
-| 报表 | GET | `/api/report/overview` | 今日运行概览 |
+| 模块 | 路径 | 说明 |
+|---|---|---|
+| 认证 | `POST /api/auth/login` | 用户登录 |
+| 设备 | `POST /api/device` | 新增设备 |
+| 设备 | `GET /api/device/page` | 分页查询设备 |
+| 设备 | `GET /api/device/{id}` | 查询设备详情 |
+| 设备 | `PUT /api/device/{id}` | 修改设备 |
+| 设备 | `DELETE /api/device/{id}` | 删除设备 |
+| 数据 | `POST /api/device/data/report` | 上报运行数据 |
+| 数据 | `GET /api/device/data/latest/{deviceCode}` | 查询最新状态 |
+| 数据 | `GET /api/device/data/history` | 查询历史数据 |
+| 告警 | `GET /api/alarm/record/page` | 分页查询告警 |
+| 告警 | `GET /api/alarm/record/{id}` | 查询告警详情 |
+| 告警 | `PUT /api/alarm/record/{id}/ack` | 确认告警 |
+| 告警 | `PUT /api/alarm/record/{id}/recover` | 恢复告警 |
+| 规则 | `POST /api/alarm/rule` | 新增告警规则 |
+| 规则 | `GET /api/alarm/rule/page` | 分页查询规则 |
+| 规则 | `GET /api/alarm/rule/{id}` | 查询规则详情 |
+| 规则 | `PUT /api/alarm/rule/{id}` | 修改规则 |
+| 规则 | `DELETE /api/alarm/rule/{id}` | 删除规则 |
+| 规则 | `PUT /api/alarm/rule/{id}/enable` | 启用规则 |
+| 规则 | `PUT /api/alarm/rule/{id}/disable` | 禁用规则 |
+| 工单 | `GET /api/work-order/page` | 分页查询工单 |
+| 工单 | `GET /api/work-order/{id}` | 查询工单详情 |
+| 工单 | `PUT /api/work-order/{id}/accept` | 接单 |
+| 工单 | `PUT /api/work-order/{id}/finish` | 完成工单 |
+| 工单 | `PUT /api/work-order/{id}/close` | 关闭工单 |
+| 工单 | `DELETE /api/work-order/{id}` | 删除工单 |
+| 报表 | `GET /api/report/overview` | 今日运行概览 |
 
-详细接口文档见 [docs/04-接口文档说明.md](docs/04-接口文档说明.md)。
+## WebSocket 测试
 
----
+浏览器控制台连接：
 
-## 测试账号
-
-| 用户名 | 密码 | 角色 | 说明 |
-|---|---|---|---|
-| admin | 123456 | admin（系统管理员） | 拥有全部权限 |
-| operator | 123456 | operator（运维人员） | 设备状态查看、告警确认和恢复 |
-| viewer | 123456 | viewer（只读用户） | 只能查看 |
-
----
-
-## 测试 JSON
-
-常用接口测试 JSON 见 [docs/test-json/](docs/test-json/) 目录：
-
-| 文件 | 对应接口 |
-|---|---|
-| `login.json` | 登录 |
-| `create-device.json` | 新增设备 |
-| `update-device.json` | 修改设备 |
-| `data-report-normal.json` | 上报正常数据 |
-| `data-report-temp-alarm.json` | 上报触发温度告警 |
-| `data-report-volt-alarm.json` | 上报触发电压告警 |
-| `data-report-delay-alarm.json` | 上报触发网络延迟告警 |
-
----
+```javascript
+const ws = new WebSocket("ws://localhost:8080/ws/alarm");
+ws.onmessage = (e) => console.log("收到推送:", JSON.parse(e.data));
+```
 
 ## Redis Key 约定
 
 | Key | 类型 | 说明 |
 |---|---|---|
-| `device:status:{deviceCode}` | String (JSON) | 设备最新运行状态 |
+| `device:status:{deviceCode}` | String | 设备最新运行状态 |
 | `device:heartbeat:{deviceCode}` | String | 设备最近心跳时间 |
-| `device:online:set` | Set | 当前在线设备编号集合 |
-| `device:alarm:set` | Set | 当前存在未恢复告警的设备编号集合 |
+| `device:online:set` | Set | 当前在线设备集合 |
+| `device:alarm:set` | Set | 当前告警设备集合 |
+| `alarm:rule:enabled:THRESHOLD` | String | 启用阈值规则缓存 |
+| `alarm:continuous:window:{deviceCode}:{ruleCode}` | List | 连续异常滑动窗口 |
 
----
+## 核心亮点
 
-## MVP 告警规则
+1. **RabbitMQ 异步告警** — 设备数据上报与告警检测解耦，降低接口阻塞风险
+2. **动态告警规则配置** — alarm_rule 表 + 管理接口，运行时修改规则即时生效
+3. **Redis 规则缓存** — Cache Aside 模式，规则变更后主动清缓存
+4. **连续异常滑动窗口** — Redis List + LPUSH/LTRIM，窗口内命中次数达阈值才触发
+5. **WebSocket 实时推送** — 告警生成后事务提交即推，广播模式
+6. **自动工单生成** — 严重告警自动建单，uk_alarm_id 唯一索引防重复
+7. **工单状态流转** — 待处理 → 处理中 → 已完成 / 已关闭，状态校验
 
-当前规则写死在代码中（第二阶段改为 `alarm_rule` 表动态配置）：
-
-| 指标 | 条件 | 告警等级 | 类型 |
-|---|---|---|---|
-| temperature（温度） | `> 80℃` | 3（严重） | THRESHOLD |
-| voltage（电压） | `< 180V` | 2（重要） | THRESHOLD |
-| networkDelay（网络延迟） | `> 200ms` | 1（一般） | THRESHOLD |
-
----
-
-## 告警去重规则
-
-- 去重维度：`deviceCode + alarmType + alarmMetric + 未恢复状态`
-- 同一设备同一指标未恢复时，不新增记录，只更新 `alarm_count` 和 `last_time`
-- 告警恢复后再次触发则生成新告警
-
----
-
-## 第二阶段规划
-
-按优先级排列：
-
-1. **设备离线检测定时任务** — 定时扫描心跳超时设备，自动标记离线并生成 OFFLINE 告警
-2. **抽取 AlarmDetectService** — 将告警检测逻辑从 DeviceDataServiceImpl 中独立出来
-3. **动态告警规则表** — 启用 `alarm_rule` 表，实现后台可配置告警规则
-4. **RabbitMQ 异步告警** — 数据上报与告警检测解耦
-5. **WebSocket 实时推送** — 告警产生、状态变化、设备离线等实时推送
-6. **工单流转模块** — 告警自动建单、派发、处理、关闭，形成运维闭环
-
-详见 [docs/01-需求说明.md](docs/01-需求说明.md) 第 11 节。
-
----
-
-## 项目文档索引
+## 项目文档
 
 | 文档 | 内容 |
 |---|---|
-| [01-需求说明.md](docs/01-需求说明.md) | 项目背景、目标用户、业务流程、功能范围、验收标准 |
-| [02-系统架构设计.md](docs/02-系统架构设计.md) | 系统架构、技术选型、分层设计 |
-| [03-数据库设计.md](docs/03-数据库设计.md) | 表结构、字段说明、索引、枚举值 |
-| [04-接口文档说明.md](docs/04-接口文档说明.md) | 全部接口路径、参数、响应、状态码 |
-| [05-告警规则设计.md](docs/05-告警规则设计.md) | 告警规则体系、去重策略、扩展方向 |
-| [06-部署运行文档.md](docs/06-部署运行文档.md) | 环境要求、部署步骤、配置说明 |
+| [01-需求说明](docs/01-需求说明.md) | 项目背景、目标、功能范围 |
+| [02-系统架构设计](docs/02-系统架构设计.md) | 架构设计、技术选型 |
+| [03-数据库设计](docs/03-数据库设计.md) | 表结构、字段、索引 |
+| [04-接口文档说明](docs/04-接口文档说明.md) | 全部接口参数与响应 |
+| [05-告警规则设计](docs/05-告警规则设计.md) | 规则体系、去重策略 |
+| [06-部署运行文档](docs/06-部署运行文档.md) | 环境要求、部署步骤 |
+| [07-接口测试指南](docs/07-接口测试指南.md) | 完整测试流程 |
+| [08-项目亮点总结](docs/08-项目亮点总结.md) | 技术亮点归纳 |
