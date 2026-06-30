@@ -5,6 +5,7 @@ import com.ccbcc.charge.monitor.common.constants.RabbitMqConstants;
 import com.ccbcc.charge.monitor.module.alarm.mq.message.DeviceDataReportMessage;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
 import com.ccbcc.charge.monitor.module.alarm.websocket.AlarmPushService;
+import com.ccbcc.charge.monitor.module.workorder.service.WorkOrderAutoGenerateService;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceInfo;
 import com.ccbcc.charge.monitor.module.device.mapper.DeviceDataMapper;
@@ -33,7 +34,7 @@ import java.util.List;
  * 5. 新增或更新 alarm_record
  * 6. 更新 Redis device:alarm:set
  *
- * 7. 事务提交成功后通过 WebSocket 推送告警消息
+ * 7. 事务提交成功后自动生成工单 + WebSocket 推送告警消息
  *
  * 注意：
  * OFFLINE 离线告警仍由 DeviceOfflineCheckTask 负责。
@@ -47,6 +48,7 @@ public class DeviceDataAlarmConsumer {
     private final DeviceInfoMapper deviceInfoMapper;
     private final AlarmDetectService alarmDetectService;
     private final AlarmPushService alarmPushService;
+    private final WorkOrderAutoGenerateService workOrderAutoGenerateService;
 
     /**
      * 处理设备数据上报消息
@@ -151,22 +153,22 @@ public class DeviceDataAlarmConsumer {
         );
 
         /*
-         * 5. 事务提交成功后推送 WebSocket 告警消息
+         * 5. 事务提交后执行后置动作：自动工单 + WebSocket 推送
          *
-         * 不要在事务提交前推送。
-         * 否则前端可能收到推送消息，但告警记录事务还没提交，点击详情查不到数据。
+         * 不要在事务提交前执行。
+         * 否则告警记录事务还没提交，下游拿不到数据。
          */
-        pushAlarmAfterTransactionCommit(allAlarmIds);
+        handleAlarmAfterTransactionCommit(allAlarmIds);
     }
 
     /**
-     * 事务提交成功后推送 WebSocket 告警消息
+     * 事务提交后执行告警后置动作
      *
-     * 为什么不在检测完成后直接推送：
-     * 告警记录在事务中新增或更新，如果事务还没提交就推送，
-     * 前端收到推送后点击详情可能查不到数据。
+     * 包含：
+     * 1. 严重告警自动生成工单
+     * 2. WebSocket 实时推送
      */
-    private void pushAlarmAfterTransactionCommit(List<Long> alarmIds) {
+    private void handleAlarmAfterTransactionCommit(List<Long> alarmIds) {
         if (alarmIds == null || alarmIds.isEmpty()) {
             return;
         }
@@ -176,14 +178,14 @@ public class DeviceDataAlarmConsumer {
 
                 @Override
                 public void afterCommit() {
-                    alarmPushService.pushAlarmMessages(alarmIds);
+                    handleAlarmAfterCommit(alarmIds);
                 }
 
                 @Override
                 public void afterCompletion(int status) {
                     if (status != STATUS_COMMITTED) {
                         log.warn(
-                                "告警检测事务未提交成功，取消 WebSocket 推送，alarmIds={}，status={}",
+                                "告警检测事务未提交成功，取消自动工单和 WebSocket 推送，alarmIds={}，status={}",
                                 alarmIds,
                                 status
                         );
@@ -197,7 +199,37 @@ public class DeviceDataAlarmConsumer {
          * 理论上不会走到这里，因为 handleDeviceDataReportMessage 有 @Transactional。
          * 这里作为兜底。
          */
-        alarmPushService.pushAlarmMessages(alarmIds);
+        handleAlarmAfterCommit(alarmIds);
+    }
+
+    /**
+     * 事务提交成功后的具体动作
+     */
+    private void handleAlarmAfterCommit(List<Long> alarmIds) {
+        /*
+         * 1. 自动生成工单
+         *
+         * 注意：
+         * 自动工单失败不应该影响 RabbitMQ 消息消费成功。
+         * 所以这里 catch 住异常，仅记录日志。
+         */
+        try {
+            workOrderAutoGenerateService.generateForAlarmIds(alarmIds);
+        } catch (Exception e) {
+            log.warn("严重告警自动生成工单失败，alarmIds={}", alarmIds, e);
+        }
+
+        /*
+         * 2. WebSocket 推送
+         *
+         * 工单生成后再推送。
+         * 这样后续如果推送消息里扩展 workOrderGenerated 字段，能拿到最新状态。
+         */
+        try {
+            alarmPushService.pushAlarmMessages(alarmIds);
+        } catch (Exception e) {
+            log.warn("告警 WebSocket 推送失败，alarmIds={}", alarmIds, e);
+        }
     }
 
     /**
