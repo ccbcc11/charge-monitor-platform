@@ -57,7 +57,7 @@ spring:
   # ===================== rabbitMQ配置 =====================
   rabbitmq:
     host: localhost
-    port: 5672
+    port: 56720
     username: guest
     password: guest
     virtual-host: /

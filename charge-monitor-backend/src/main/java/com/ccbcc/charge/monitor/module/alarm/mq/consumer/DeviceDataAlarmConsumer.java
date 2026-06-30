@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ccbcc.charge.monitor.common.constants.RabbitMqConstants;
 import com.ccbcc.charge.monitor.module.alarm.mq.message.DeviceDataReportMessage;
 import com.ccbcc.charge.monitor.module.alarm.service.AlarmDetectService;
+import com.ccbcc.charge.monitor.module.alarm.websocket.AlarmPushService;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceData;
 import com.ccbcc.charge.monitor.module.device.entity.DeviceInfo;
 import com.ccbcc.charge.monitor.module.device.mapper.DeviceDataMapper;
@@ -13,8 +14,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -29,6 +33,8 @@ import java.util.List;
  * 5. 新增或更新 alarm_record
  * 6. 更新 Redis device:alarm:set
  *
+ * 7. 事务提交成功后通过 WebSocket 推送告警消息
+ *
  * 注意：
  * OFFLINE 离线告警仍由 DeviceOfflineCheckTask 负责。
  */
@@ -40,6 +46,7 @@ public class DeviceDataAlarmConsumer {
     private final DeviceDataMapper deviceDataMapper;
     private final DeviceInfoMapper deviceInfoMapper;
     private final AlarmDetectService alarmDetectService;
+    private final AlarmPushService alarmPushService;
 
     /**
      * 处理设备数据上报消息
@@ -115,10 +122,18 @@ public class DeviceDataAlarmConsumer {
         List<Long> thresholdAlarmIds = alarmDetectService.detectThresholdAlarms(deviceInfo, deviceData);
         List<Long> continuousAlarmIds = alarmDetectService.detectContinuousAlarms(deviceInfo, deviceData);
 
-        int totalAlarms = (thresholdAlarmIds == null ? 0 : thresholdAlarmIds.size())
-                + (continuousAlarmIds == null ? 0 : continuousAlarmIds.size());
+        /*
+         * 4. 合并所有告警 ID
+         */
+        List<Long> allAlarmIds = new ArrayList<>();
+        if (thresholdAlarmIds != null) {
+            allAlarmIds.addAll(thresholdAlarmIds);
+        }
+        if (continuousAlarmIds != null) {
+            allAlarmIds.addAll(continuousAlarmIds);
+        }
 
-        if (totalAlarms == 0) {
+        if (allAlarmIds.isEmpty()) {
             log.info(
                     "设备数据异步告警检测完成，未触发告警，deviceDataId={}，deviceCode={}",
                     deviceData.getId(),
@@ -134,6 +149,55 @@ public class DeviceDataAlarmConsumer {
                 thresholdAlarmIds,
                 continuousAlarmIds
         );
+
+        /*
+         * 5. 事务提交成功后推送 WebSocket 告警消息
+         *
+         * 不要在事务提交前推送。
+         * 否则前端可能收到推送消息，但告警记录事务还没提交，点击详情查不到数据。
+         */
+        pushAlarmAfterTransactionCommit(allAlarmIds);
+    }
+
+    /**
+     * 事务提交成功后推送 WebSocket 告警消息
+     *
+     * 为什么不在检测完成后直接推送：
+     * 告警记录在事务中新增或更新，如果事务还没提交就推送，
+     * 前端收到推送后点击详情可能查不到数据。
+     */
+    private void pushAlarmAfterTransactionCommit(List<Long> alarmIds) {
+        if (alarmIds == null || alarmIds.isEmpty()) {
+            return;
+        }
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+
+                @Override
+                public void afterCommit() {
+                    alarmPushService.pushAlarmMessages(alarmIds);
+                }
+
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != STATUS_COMMITTED) {
+                        log.warn(
+                                "告警检测事务未提交成功，取消 WebSocket 推送，alarmIds={}，status={}",
+                                alarmIds,
+                                status
+                        );
+                    }
+                }
+            });
+            return;
+        }
+
+        /*
+         * 理论上不会走到这里，因为 handleDeviceDataReportMessage 有 @Transactional。
+         * 这里作为兜底。
+         */
+        alarmPushService.pushAlarmMessages(alarmIds);
     }
 
     /**
